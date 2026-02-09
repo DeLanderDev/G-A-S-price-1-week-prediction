@@ -10,6 +10,7 @@ from config import (
     CRUDE_LAG_WEEKS,
     DRIVING_SEASON_END_WEEK,
     DRIVING_SEASON_START_WEEK,
+    FUTURES_CURVE_WINDOWS,
     HURRICANE_PEAK_END_WEEK,
     HURRICANE_PEAK_START_WEEK,
     HURRICANE_SEASON_END_WEEK,
@@ -237,6 +238,46 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
         df["crude_imports_pct_change_1w"] = df["crude_imports"].pct_change(1) * 100
 
     # ═══════════════════════════════════════════════════════════════════════
+    #  FUTURES CURVE PROXY (USO vs CL=F return divergence)
+    # ═══════════════════════════════════════════════════════════════════════
+    # USO holds rolling crude futures and bleeds value in contango (sells
+    # cheap near-month, buys expensive far-month). The rolling divergence
+    # between CL=F returns and USO returns is a direct proxy for the
+    # futures curve shape: positive = contango, negative = backwardation.
+    if _safe_col(df, "uso_price") and _safe_col(df, "crude_price"):
+        crude_ret = df["crude_price"].pct_change()
+        uso_ret = df["uso_price"].pct_change()
+        # Per-week return divergence (crude return minus USO return)
+        df["curve_divergence_1w"] = crude_ret - uso_ret
+
+        for w in FUTURES_CURVE_WINDOWS:
+            # Rolling cumulative return divergence over w weeks
+            df[f"curve_divergence_{w}w"] = (
+                crude_ret.rolling(w).sum() - uso_ret.rolling(w).sum()
+            )
+        # Sign flag: 1 = contango-like, 0 = backwardation-like (over 8 weeks)
+        if "curve_divergence_8w" in df.columns:
+            df["curve_contango_flag"] = (df["curve_divergence_8w"] > 0).astype(int)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  GOOGLE TRENDS FEATURES ("gas prices" search interest)
+    # ═══════════════════════════════════════════════════════════════════════
+    # Spikes in "gas prices" searches often lead EIA-reported price moves.
+    if _safe_col(df, "gtrends_gas_prices"):
+        gt = df["gtrends_gas_prices"]
+        df["gtrends_level"] = gt
+        df["gtrends_change_1w"] = gt - gt.shift(1)
+        df["gtrends_change_4w"] = gt - gt.shift(4)
+        df["gtrends_pct_change_1w"] = gt.pct_change(1) * 100
+        # Deviation from rolling average (spike detector)
+        gt_mean_12w = gt.rolling(12).mean()
+        gt_std_12w = gt.rolling(12).std()
+        df["gtrends_vs_ma_12w"] = gt - gt_mean_12w
+        df["gtrends_zscore_12w"] = (gt - gt_mean_12w) / gt_std_12w.replace(0, np.nan)
+        # Binary spike flag: >1.5 std above 12-week mean
+        df["gtrends_spike"] = (df["gtrends_zscore_12w"] > 1.5).astype(int)
+
+    # ═══════════════════════════════════════════════════════════════════════
     #  CALENDAR / SEASONAL FEATURES
     # ═══════════════════════════════════════════════════════════════════════
     df["week_of_year"] = df["date"].dt.isocalendar().week.astype(int)
@@ -313,6 +354,7 @@ def get_feature_columns(df: pd.DataFrame) -> list:
         "gasoline_stocks", "crude_stocks", "refinery_utilization",
         "gasoline_production", "gasoline_demand", "crude_imports",
         "distillate_stocks", "uga_etf_price",
+        "uso_price", "gtrends_gas_prices",
     }
     exclude.update(raw_cols)
 
