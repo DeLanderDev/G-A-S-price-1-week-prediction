@@ -271,6 +271,53 @@ def fetch_all_fred_data(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  GOOGLE TRENDS DATA
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def fetch_google_trends(years: int = DEFAULT_HISTORY_YEARS) -> pd.DataFrame:
+    """
+    Fetch weekly Google Trends interest for "gas prices".
+    Returns a weekly DataFrame with a 'gtrends_gas_prices' column (0-100 scale).
+    Gracefully returns empty DataFrame if pytrends is unavailable or rate-limited.
+    """
+    try:
+        from pytrends.request import TrendReq
+    except ImportError:
+        print("  Warning: pytrends not installed — skipping Google Trends data")
+        return pd.DataFrame(columns=["date", "gtrends_gas_prices"])
+
+    try:
+        pytrends = TrendReq(hl="en-US", tz=360, timeout=(10, 25))
+        # Google Trends allows max ~5 years per request; build timeframe string
+        end = datetime.now()
+        start = end - timedelta(days=365 * years)
+        tf = f"{start.strftime('%Y-%m-%d')} {end.strftime('%Y-%m-%d')}"
+
+        pytrends.build_payload(["gas prices"], cat=0, timeframe=tf, geo="US")
+        interest = pytrends.interest_over_time()
+
+        if interest.empty:
+            print("  Warning: Google Trends returned empty data")
+            return pd.DataFrame(columns=["date", "gtrends_gas_prices"])
+
+        df = interest[["gas prices"]].copy()
+        df.columns = ["gtrends_gas_prices"]
+        df.index.name = "date"
+        df = df.reset_index()
+        df["date"] = pd.to_datetime(df["date"])
+
+        # Resample to weekly Sunday to match our pipeline
+        df = df.set_index("date").resample("W").last().ffill().reset_index()
+
+        print(f"  Google Trends: {len(df)} weeks fetched")
+        return df
+
+    except Exception as e:
+        print(f"  Warning: Google Trends fetch failed (rate limit or network): {e}")
+        return pd.DataFrame(columns=["date", "gtrends_gas_prices"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  COMBINED DATASET
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -295,6 +342,9 @@ def build_combined_dataset(
     print("Fetching FRED economic data...")
     fred_df = fetch_all_fred_data(fred_api_key, years=years)
 
+    print("Fetching Google Trends data...")
+    gtrends_df = fetch_google_trends(years=years)
+
     # Align everything to weekly Sunday dates
     gas_df["date"] = gas_df["date"].dt.to_period("W").dt.to_timestamp("W")
     market_df["date"] = market_df["date"].dt.to_period("W").dt.to_timestamp("W")
@@ -305,6 +355,9 @@ def build_combined_dataset(
     if not fred_df.empty and "date" in fred_df.columns:
         fred_df["date"] = fred_df["date"].dt.to_period("W").dt.to_timestamp("W")
 
+    if not gtrends_df.empty and "date" in gtrends_df.columns:
+        gtrends_df["date"] = gtrends_df["date"].dt.to_period("W").dt.to_timestamp("W")
+
     # Merge all datasets
     combined = pd.merge(gas_df, market_df, on="date", how="inner")
 
@@ -313,6 +366,9 @@ def build_combined_dataset(
 
     if not fred_df.empty and len(fred_df.columns) > 1:
         combined = pd.merge(combined, fred_df, on="date", how="left")
+
+    if not gtrends_df.empty and len(gtrends_df.columns) > 1:
+        combined = pd.merge(combined, gtrends_df, on="date", how="left")
 
     combined = combined.sort_values("date").reset_index(drop=True)
 

@@ -44,6 +44,7 @@ YAHOO_TICKERS = {
     "NG=F":      "natgas",        # Natural Gas Futures
     "DX-Y.NYB":  "dollar_idx",    # US Dollar Index Futures
     "^GSPC":     "sp500",         # S&P 500 Index
+    "USO":       "uso",           # United States Oil Fund ETF (rolling futures)
 }
 
 # ─── FRED Series IDs ─────────────────────────────────────────────────────────
@@ -64,6 +65,7 @@ PRICE_LAG_WEEKS = [1, 2, 3, 4]
 CRUDE_LAG_WEEKS = [1, 2]
 RBOB_LAG_WEEKS = [1, 2]
 ROLLING_WINDOWS = [4, 8, 12]
+FUTURES_CURVE_WINDOWS = [4, 8, 12]  # Weeks for USO vs CL=F return divergence
 
 SUMMER_BLEND_START_WEEK = 14
 SUMMER_BLEND_END_WEEK = 40
