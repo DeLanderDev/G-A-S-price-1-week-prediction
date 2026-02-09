@@ -105,7 +105,9 @@ with st.sidebar:
         "**Yahoo Finance** — WTI & Brent crude, RBOB gasoline, "
         "heating oil, natural gas, US Dollar Index, S&P 500\n\n"
         "**FRED** — trade-weighted dollar, treasury yields, "
-        "yield curve, VIX, CPI, Henry Hub gas, EUR/USD"
+        "yield curve, VIX, CPI, Henry Hub gas, EUR/USD\n\n"
+        "**Google Trends** — weekly search interest for \"gas prices\" "
+        "(0-100 scale), used to detect demand spikes"
     )
 
 # ─── Main Content ────────────────────────────────────────────────────────────
@@ -128,8 +130,9 @@ if not eia_key:
     with col1:
         st.markdown("### 📊 Data Collection")
         st.markdown(
-            "Pulls weekly data from **3 sources**: EIA (prices + supply/demand), "
-            "Yahoo Finance (futures & indices), and FRED (economic indicators)."
+            "Pulls weekly data from **4 sources**: EIA (prices + supply/demand), "
+            "Yahoo Finance (futures & indices), FRED (economic indicators), "
+            "and Google Trends (search interest for \"gas prices\")."
         )
     with col2:
         st.markdown("### 🔧 Feature Engineering")
@@ -154,7 +157,7 @@ def load_data(eia: str, fred: str, years: int) -> pd.DataFrame:
 
 
 data = None
-with st.spinner("📡 Fetching data from EIA, Yahoo Finance, and FRED..."):
+with st.spinner("📡 Fetching data from EIA, Yahoo Finance, FRED, and Google Trends..."):
     try:
         data = load_data(eia_key, fred_key, history_years)
     except Exception as e:
@@ -192,12 +195,22 @@ yahoo_count = sum(
     if c in data_cols and data[c].notna().sum() > 10
 )
 
+gtrends_available = (
+    "gtrends_gas_prices" in data_cols
+    and data["gtrends_gas_prices"].notna().sum() > 10
+)
+
 source_parts = [f"**EIA**: gas prices + {eia_supply} supply/demand series"]
 source_parts.append(f"**Yahoo**: {yahoo_count} market tickers")
 if fred_count > 0:
     source_parts.append(f"**FRED**: {fred_count} economic indicators")
 else:
     source_parts.append("**FRED**: *not connected — add key for more accuracy*")
+if gtrends_available:
+    gtrends_weeks = int(data["gtrends_gas_prices"].notna().sum())
+    source_parts.append(f"**Google Trends**: {gtrends_weeks} weeks of search data")
+else:
+    source_parts.append("**Google Trends**: *unavailable*")
 
 st.caption(f"📊 Data loaded: {len(data)} weeks | " + " | ".join(source_parts))
 
@@ -614,6 +627,12 @@ with tab3:
         "refinery_x_": "Refinery × hurricane season interaction",
         "stocks_x_": "Inventory × driving season interaction",
         "dollar_x_": "Dollar × crude oil interaction",
+        "gtrends_level": "Google Trends: raw search interest (0-100)",
+        "gtrends_change_": "Google Trends: change in search interest",
+        "gtrends_pct_change_": "Google Trends: percent change in interest",
+        "gtrends_vs_ma_": "Google Trends: deviation from moving average",
+        "gtrends_zscore_": "Google Trends: standardized spike score",
+        "gtrends_spike": "Google Trends: spike flag (>1.5 std above mean)",
     }
 
     if not importance_df.empty:
@@ -750,6 +769,115 @@ with tab4:
 
         fig_mkt.update_layout(height=350, template="plotly_dark")
         st.plotly_chart(fig_mkt, use_container_width=True)
+
+    # Google Trends
+    st.subheader("Google Trends — \"gas prices\" Search Interest")
+
+    if "gtrends_gas_prices" in data.columns and data["gtrends_gas_prices"].notna().sum() > 10:
+        gt_data = data[["date", "gtrends_gas_prices"]].dropna(subset=["gtrends_gas_prices"])
+
+        fig_gt = make_subplots(
+            rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.10,
+            row_heights=[0.6, 0.4],
+            subplot_titles=(
+                "Google Trends: \"gas prices\" Search Interest (0-100)",
+                "Search Interest vs Gas Price",
+            ),
+        )
+
+        # Main trends line
+        fig_gt.add_trace(go.Scatter(
+            x=gt_data["date"], y=gt_data["gtrends_gas_prices"],
+            mode="lines", name="Search Interest",
+            line=dict(color="#a78bfa", width=2),
+            fill="tozeroy", fillcolor="rgba(167, 139, 250, 0.15)",
+        ), row=1, col=1)
+
+        # 12-week moving average
+        gt_ma = gt_data["gtrends_gas_prices"].rolling(12, min_periods=1).mean()
+        fig_gt.add_trace(go.Scatter(
+            x=gt_data["date"], y=gt_ma,
+            mode="lines", name="12-Week Avg",
+            line=dict(color="#ffd43b", width=2, dash="dash"),
+        ), row=1, col=1)
+
+        # Spike detection: >1.5 std above 12-week mean
+        gt_std = gt_data["gtrends_gas_prices"].rolling(12).std()
+        spike_threshold = gt_ma + 1.5 * gt_std
+        spikes = gt_data[gt_data["gtrends_gas_prices"] > spike_threshold]
+        if not spikes.empty:
+            fig_gt.add_trace(go.Scatter(
+                x=spikes["date"], y=spikes["gtrends_gas_prices"],
+                mode="markers", name="Spike Detected",
+                marker=dict(color="#ff6b6b", size=8, symbol="triangle-up",
+                            line=dict(width=1, color="white")),
+            ), row=1, col=1)
+
+        # Overlay gas price on second subplot for comparison
+        gt_merged = data[["date", "gtrends_gas_prices", "gas_price"]].dropna(
+            subset=["gtrends_gas_prices", "gas_price"]
+        )
+        fig_gt.add_trace(go.Scatter(
+            x=gt_merged["date"], y=gt_merged["gas_price"],
+            mode="lines", name="Gas Price ($/gal)",
+            line=dict(color="#4dabf7", width=2),
+        ), row=2, col=1)
+
+        # Add search interest on secondary y-axis of the second subplot
+        fig_gt.add_trace(go.Scatter(
+            x=gt_merged["date"], y=gt_merged["gtrends_gas_prices"],
+            mode="lines", name="Search Interest (right axis)",
+            line=dict(color="#a78bfa", width=1.5, dash="dot"),
+            yaxis="y4",
+        ), row=2, col=1)
+
+        fig_gt.update_layout(
+            height=550, template="plotly_dark",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            margin=dict(l=60, r=60, t=60, b=30),
+            yaxis4=dict(
+                overlaying="y3", side="right", title="Search Interest (0-100)",
+                showgrid=False, range=[0, 100],
+            ),
+        )
+        fig_gt.update_yaxes(title_text="Interest (0-100)", row=1, col=1)
+        fig_gt.update_yaxes(title_text="Price ($/gal)", row=2, col=1)
+        st.plotly_chart(fig_gt, use_container_width=True)
+
+        # Summary stats
+        latest_gt = gt_data["gtrends_gas_prices"].iloc[-1]
+        avg_gt = gt_data["gtrends_gas_prices"].mean()
+        max_gt = gt_data["gtrends_gas_prices"].max()
+        max_gt_date = gt_data.loc[gt_data["gtrends_gas_prices"].idxmax(), "date"]
+
+        gc1, gc2, gc3, gc4 = st.columns(4)
+        gc1.metric("Current Interest", f"{latest_gt:.0f}/100")
+        gc2.metric("Average", f"{avg_gt:.0f}/100")
+        gc3.metric("Peak Interest", f"{max_gt:.0f}/100")
+        gc4.metric("Peak Date", f"{max_gt_date:%Y-%m-%d}")
+
+        # Interpretation
+        if latest_gt > avg_gt * 1.3:
+            st.warning(
+                f"Search interest ({latest_gt:.0f}) is **above average** ({avg_gt:.0f}). "
+                "Elevated public attention to gas prices often correlates with rising prices."
+            )
+        elif latest_gt < avg_gt * 0.7:
+            st.info(
+                f"Search interest ({latest_gt:.0f}) is **below average** ({avg_gt:.0f}). "
+                "Low search activity suggests gas prices may not be top-of-mind for consumers."
+            )
+        else:
+            st.caption(
+                f"Search interest ({latest_gt:.0f}) is near the average ({avg_gt:.0f})."
+            )
+    else:
+        st.info(
+            "Google Trends data is not available. This can happen if:\n"
+            "- The `pytrends` package is not installed (`pip install pytrends`)\n"
+            "- Google rate-limited the request (try again in a few minutes)\n"
+            "- Network connectivity issues"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1007,7 +1135,7 @@ with tab6:
 st.markdown("---")
 st.markdown(
     "<div style='text-align: center; color: #666; font-size: 0.85rem;'>"
-    "⛽ Gas Price Predictor | Data: EIA + Yahoo Finance + FRED | Model: XGBoost<br>"
+    "⛽ Gas Price Predictor | Data: EIA + Yahoo Finance + FRED + Google Trends | Model: XGBoost<br>"
     "Predictions are estimates only — not financial advice. "
     "Actual prices may differ due to unforeseen events.<br>"
     f"Last updated: {datetime.now():%Y-%m-%d %H:%M} | "
