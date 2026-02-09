@@ -19,6 +19,15 @@ from config import DEFAULT_HISTORY_YEARS, MIN_DATA_POINTS
 from data_collector import build_combined_dataset
 from feature_engine import create_features, get_feature_columns
 from model import GasPriceModel
+from prediction_log import (
+    save_prediction,
+    load_prediction_log,
+    backfill_actuals_from_data,
+    clear_log,
+    PredictionScheduler,
+    load_schedule_config,
+    delete_schedule_config,
+)
 
 # ─── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -335,13 +344,29 @@ if use_aaa:
     )
 st.markdown(summary, unsafe_allow_html=True)
 
+# ─── Save Prediction Button ──────────────────────────────────────────────────
+save_col1, save_col2 = st.columns([1, 4])
+with save_col1:
+    if st.button("💾 Save Prediction", type="primary"):
+        ts = save_prediction(display, prediction, save_type="manual")
+        st.success(f"Prediction saved at {ts}")
+with save_col2:
+    st.caption(
+        "Save the current prediction with a timestamp so you can compare "
+        "accuracy across different days and times."
+    )
+
+# ─── Auto-backfill actuals from loaded data ──────────────────────────────────
+backfill_actuals_from_data(data)
+
 # ─── Tabs ─────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📈 Price & Forecast",
     "🎯 Model Accuracy",
     "🔍 Feature Analysis",
     "🛢️ Supply & Demand",
     "📋 Data Explorer",
+    "📝 Prediction Log",
 ])
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -765,6 +790,217 @@ with tab5:
         ],
     })
     st.dataframe(feat_display, use_container_width=True, hide_index=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TAB 6: Prediction Log & Scheduler
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab6:
+    st.subheader("Saved Predictions")
+
+    log_df = load_prediction_log()
+
+    if log_df.empty:
+        st.info(
+            "No predictions saved yet. Click **Save Prediction** above "
+            "to start tracking predictions over time."
+        )
+    else:
+        # ── Summary metrics ───────────────────────────────────────────────
+        has_actuals = log_df["actual_price"].notna() & (log_df["actual_price"] != "")
+        n_total = len(log_df)
+        n_with_actuals = has_actuals.sum()
+
+        lc1, lc2, lc3, lc4 = st.columns(4)
+        lc1.metric("Total Saved", n_total)
+        lc2.metric("With Actuals", int(n_with_actuals))
+
+        if n_with_actuals > 0:
+            filled = log_df[has_actuals].copy()
+            filled["abs_error"] = pd.to_numeric(filled["abs_error"], errors="coerce")
+            avg_err = filled["abs_error"].mean()
+            within_2c = (filled["abs_error"] <= 0.02).mean() * 100
+            lc3.metric("Avg Abs Error", f"${avg_err:.4f}" if not pd.isna(avg_err) else "N/A")
+            lc4.metric("Within ±$0.02", f"{within_2c:.1f}%" if not pd.isna(within_2c) else "N/A")
+        else:
+            lc3.metric("Avg Abs Error", "—")
+            lc4.metric("Within ±$0.02", "—")
+
+        # ── Accuracy by day of week and hour ──────────────────────────────
+        if n_with_actuals >= 2:
+            st.subheader("Accuracy by Save Day & Time")
+
+            filled = log_df[has_actuals].copy()
+            filled["abs_error"] = pd.to_numeric(filled["abs_error"], errors="coerce")
+            filled["save_dow"] = filled["save_timestamp"].dt.day_name()
+            filled["save_hour"] = filled["save_timestamp"].dt.hour
+
+            acc_col1, acc_col2 = st.columns(2)
+
+            with acc_col1:
+                by_day = (
+                    filled.groupby("save_dow")["abs_error"]
+                    .agg(["mean", "count"])
+                    .reindex(["Monday", "Tuesday", "Wednesday", "Thursday",
+                              "Friday", "Saturday", "Sunday"])
+                    .dropna()
+                )
+                if not by_day.empty:
+                    fig_day = go.Figure()
+                    fig_day.add_trace(go.Bar(
+                        x=by_day.index,
+                        y=by_day["mean"],
+                        text=[f"n={int(c)}" for c in by_day["count"]],
+                        textposition="outside",
+                        marker_color="#4dabf7",
+                    ))
+                    fig_day.update_layout(
+                        title="Mean Abs Error by Day of Week (Save Day)",
+                        height=350, template="plotly_dark",
+                        yaxis_title="Mean Abs Error ($/gal)",
+                    )
+                    st.plotly_chart(fig_day, use_container_width=True)
+
+            with acc_col2:
+                by_hour = (
+                    filled.groupby("save_hour")["abs_error"]
+                    .agg(["mean", "count"])
+                )
+                if not by_hour.empty:
+                    fig_hour = go.Figure()
+                    fig_hour.add_trace(go.Bar(
+                        x=[f"{int(h):02d}:00" for h in by_hour.index],
+                        y=by_hour["mean"],
+                        text=[f"n={int(c)}" for c in by_hour["count"]],
+                        textposition="outside",
+                        marker_color="#ffa94d",
+                    ))
+                    fig_hour.update_layout(
+                        title="Mean Abs Error by Hour of Day (Save Time)",
+                        height=350, template="plotly_dark",
+                        yaxis_title="Mean Abs Error ($/gal)",
+                    )
+                    st.plotly_chart(fig_hour, use_container_width=True)
+
+        # ── Prediction log table ──────────────────────────────────────────
+        st.subheader("Prediction History")
+        display_log = log_df.copy()
+        display_log["save_timestamp"] = display_log["save_timestamp"].dt.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        display_log["prediction_for_date"] = pd.to_datetime(
+            display_log["prediction_for_date"], errors="coerce"
+        ).dt.strftime("%Y-%m-%d")
+        st.dataframe(
+            display_log.iloc[::-1].reset_index(drop=True),
+            use_container_width=True, hide_index=True,
+        )
+
+        # Download and clear buttons
+        dl_col, clr_col, _ = st.columns([1, 1, 3])
+        with dl_col:
+            csv_data = log_df.to_csv(index=False)
+            st.download_button(
+                "📥 Download Log (CSV)", data=csv_data,
+                file_name=f"prediction_log_{datetime.now():%Y%m%d}.csv",
+                mime="text/csv",
+            )
+        with clr_col:
+            if st.button("🗑️ Clear Log"):
+                clear_log()
+                st.rerun()
+
+    # ── Auto-Scheduler ────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Automatic Prediction Scheduler")
+    st.markdown(
+        "Schedule automatic prediction saves while the app is running. "
+        "Predictions are saved at the chosen times so you can later compare "
+        "which days and times produce the most accurate results."
+    )
+
+    # Initialize scheduler in session state
+    if "scheduler" not in st.session_state:
+        st.session_state.scheduler = PredictionScheduler()
+
+    scheduler = st.session_state.scheduler
+
+    # Show current schedule status
+    existing_config = load_schedule_config()
+    if scheduler.is_running:
+        st.success(
+            f"Scheduler is **running** since "
+            f"{existing_config.get('started_at', 'unknown') if existing_config else 'unknown'}."
+        )
+        if existing_config:
+            st.caption(
+                f"Frequency: {existing_config.get('frequency', '?').replace('_', ' ')} | "
+                f"Times: {', '.join(existing_config.get('times', []))} | "
+                f"Ends: {existing_config.get('end_date', '?')}"
+            )
+        if st.button("⏹️ Stop Scheduler"):
+            scheduler.stop()
+            st.success("Scheduler stopped.")
+            st.rerun()
+    else:
+        # Schedule configuration form
+        with st.form("schedule_form"):
+            sched_col1, sched_col2 = st.columns(2)
+
+            with sched_col1:
+                frequency = st.selectbox(
+                    "Frequency",
+                    options=["once_per_day", "twice_per_day"],
+                    format_func=lambda x: x.replace("_", " ").title(),
+                )
+                time_1 = st.time_input(
+                    "First save time", value=datetime.strptime("08:00", "%H:%M").time()
+                )
+
+            with sched_col2:
+                time_2 = st.time_input(
+                    "Second save time (for twice per day)",
+                    value=datetime.strptime("20:00", "%H:%M").time(),
+                )
+                end_date = st.date_input(
+                    "Run until (end date)",
+                    value=datetime.now().date() + timedelta(days=7),
+                    min_value=datetime.now().date() + timedelta(days=1),
+                )
+
+            duration_days = (end_date - datetime.now().date()).days
+            st.caption(
+                f"Will save predictions for **{duration_days} day(s)** "
+                f"while the app is running."
+            )
+
+            submitted = st.form_submit_button("▶️ Start Scheduler", type="primary")
+
+            if submitted:
+                times = [time_1.strftime("%H:%M")]
+                if frequency == "twice_per_day":
+                    times.append(time_2.strftime("%H:%M"))
+
+                def make_prediction():
+                    return (display, prediction)
+
+                scheduler.start(
+                    predict_fn=make_prediction,
+                    frequency=frequency,
+                    times=times,
+                    end_date=end_date.strftime("%Y-%m-%d"),
+                )
+                st.success(
+                    f"Scheduler started! Saving {'twice' if frequency == 'twice_per_day' else 'once'} "
+                    f"daily at {', '.join(times)} until {end_date}."
+                )
+                st.rerun()
+
+        st.caption(
+            "**Note:** The scheduler runs in the background while this app is open in your browser. "
+            "If you close the browser tab or stop the Streamlit server, the scheduler will stop. "
+            "Saved predictions persist across sessions."
+        )
 
 
 # ─── Footer ──────────────────────────────────────────────────────────────────
